@@ -1,7 +1,6 @@
 import os
-from pathlib import Path
-
 import streamlit as st
+
 from pptx import Presentation
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -9,13 +8,28 @@ from langchain_google_genai import (
     GoogleGenerativeAIEmbeddings,
     ChatGoogleGenerativeAI,
 )
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==========================================
+# PAGE CONFIGURATION
+# ==========================================
 
 st.set_page_config(
-   # ===== AVIATION BACKGROUND THEME =====
+    page_title="AeroRAG",
+    page_icon="✈️",
+    layout="wide",
+)
+
+
+# ==========================================
+# DARK AVIATION BACKGROUND
+# ==========================================
 
 st.markdown("""
 <style>
-/* Full website: dark aviation gradient */
+
+/* Entire website background */
 .stApp {
     background:
         radial-gradient(
@@ -36,9 +50,15 @@ st.markdown("""
         );
 
     background-attachment: fixed;
+    color: #EAF2FF;
 }
 
-/* Aviation-inspired sidebar */
+/* Transparent top toolbar */
+.stApp > header {
+    background: transparent;
+}
+
+/* Sidebar gradient */
 section[data-testid="stSidebar"] {
     background: linear-gradient(
         180deg,
@@ -49,208 +69,356 @@ section[data-testid="stSidebar"] {
     border-right: 1px solid rgba(73, 153, 255, 0.25);
 }
 
-/* Transparent top bar */
-.stApp > header {
-    background: transparent;
-}
-
-/* Blue accent headings */
+/* Headings */
 .stApp h1,
 .stApp h2,
 .stApp h3 {
     color: #8CCBFF;
 }
 
-/* Subtle blue links */
+/* General text */
+.stApp p,
+.stApp label {
+    color: #D5E3F5;
+}
+
+/* Links */
 .stApp a {
     color: #68B6FF;
 }
 
-/* Chat panels */
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(
+        135deg,
+        #0878E8,
+        #1555B5
+    );
+    color: white;
+    border: 1px solid rgba(113, 184, 255, 0.35);
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+.stButton > button:hover {
+    background: linear-gradient(
+        135deg,
+        #168DFF,
+        #216DDA
+    );
+    color: white;
+    border-color: #70BBFF;
+}
+
+/* Chat messages */
 .stChatMessage {
     background: rgba(13, 32, 55, 0.72);
     border: 1px solid rgba(77, 145, 218, 0.20);
     border-radius: 14px;
 }
+
+/* Text input */
+.stChatInput textarea,
+.stTextInput input {
+    background-color: rgba(8, 22, 40, 0.90);
+    color: #F0F6FF;
+    border: 1px solid #294765;
+    border-radius: 10px;
+}
+
+/* File uploader */
+[data-testid="stFileUploader"] {
+    background-color: rgba(13, 32, 55, 0.55);
+    border: 1px dashed #31577E;
+    border-radius: 12px;
+}
+
+/* Dividers */
+hr {
+    border-color: rgba(86, 151, 220, 0.20);
+}
+
+.stMainBlockContainer {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
-# ===== END AVIATION BACKGROUND ===== page_title="AeroRAG",
-    page_icon="✈️",
-    layout="wide",
+
+# ==========================================
+# AERORAG HEADER
+# ==========================================
+
+st.title("✈ AeroRAG")
+
+st.subheader(
+    "AI-powered aviation knowledge assistant"
 )
 
-st.title("✈️ AeroRAG")
-st.subheader("AI-powered aviation knowledge assistant")
 st.write(
     "Ask questions about your aviation presentation. "
-    "AeroRAG retrieves relevant information and generates an answer."
+    "AeroRAG retrieves relevant information and generates "
+    "an answer based on the available material."
 )
 
-# Read the API key from Streamlit Secrets
+st.divider()
+
+
+# ==========================================
+# API KEY
+# ==========================================
+
 try:
-    api_key = st.secrets.get("GOOGLE_API_KEY")
+    api_key = st.secrets["GOOGLE_API_KEY"]
 except Exception:
     api_key = os.getenv("GOOGLE_API_KEY")
 
-if not api_key:
-    st.error(
-        "Google API key is missing. Add GOOGLE_API_KEY "
-        "in your Streamlit app Secrets."
-    )
-    st.stop()
 
-# Find PowerPoint files
-documents_folder = Path("documents")
-pptx_files = list(documents_folder.glob("*.pptx"))
+# ==========================================
+# EXISTING AVIATION DATABASE
+# ==========================================
 
-if not pptx_files:
-    st.error(
-        "No PowerPoint file was found in the documents folder. "
-        "Upload your aviation .pptx file to the documents folder on GitHub."
-    )
-    st.stop()
+DB_PATH = "chroma_db"
+COLLECTION_NAME = "aerorag"
 
 
 @st.cache_resource
-def build_vector_store(file_path, key):
-    # Extract text from the PowerPoint slides
-    presentation = Presentation(file_path)
-    slide_texts = []
-
-    for slide_number, slide in enumerate(presentation.slides, start=1):
-        slide_content = []
-
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text.strip():
-                slide_content.append(shape.text.strip())
-
-        if slide_content:
-            slide_texts.append(
-                f"Slide {slide_number}\n" + "\n".join(slide_content)
-            )
-
-    if not slide_texts:
-        raise ValueError(
-            "No readable text was found in the PowerPoint presentation."
-        )
-
-    # Split slide text into searchable chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=900,
-        chunk_overlap=150,
-    )
-
-    chunks = splitter.create_documents(slide_texts)
-
-    # Create embeddings and the searchable vector database
+def load_database():
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=key,
+        model="models/embedding-001",
+        google_api_key=api_key,
     )
 
-    vector_store = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+    database = Chroma(
+        persist_directory=DB_PATH,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
     )
 
-    return vector_store
+    return database
 
 
-# Build the knowledge base
-try:
-    with st.spinner("Preparing the aviation knowledge base..."):
-        vector_store = build_vector_store(
-            str(pptx_files[0]),
-            api_key,
-        )
-except Exception as error:
-    st.error("Could not prepare the knowledge base.")
-    st.caption(f"Technical details: {error}")
-    st.stop()
+# ==========================================
+# GEMINI MODEL
+# ==========================================
 
-# User question
-question = st.text_input(
-    "Your aviation question",
-    placeholder="Example: What does a V-n diagram show?",
+@st.cache_resource
+def load_model():
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=api_key,
+        temperature=0.1,
+    )
+
+
+# ==========================================
+# SIDEBAR
+# ==========================================
+
+with st.sidebar:
+    st.title("✈ AeroRAG")
+
+    st.caption("AVIATION INTELLIGENCE SYSTEM")
+
+    st.divider()
+
+    st.markdown("### About")
+
+    st.write(
+        "A Retrieval-Augmented Generation system "
+        "designed to answer questions using aviation documents."
+    )
+
+    st.divider()
+
+    st.markdown("### Architecture")
+
+    st.write("• Document retrieval")
+    st.write("• Vector database")
+    st.write("• Gemini language model")
+    st.write("• Source-grounded answers")
+
+
+# ==========================================
+# CHAT HISTORY
+# ==========================================
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# ==========================================
+# ASK AERORAG
+# ==========================================
+
+question = st.chat_input(
+    "Ask an aviation question..."
 )
 
-if st.button("Ask AeroRAG", type="primary"):
-    if not question.strip():
-        st.warning("Please enter a question first.")
-    else:
+if question:
+
+    st.session_state.messages.append({
+        "role": "user",
+        "content": question,
+    })
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+
         try:
-            with st.spinner("Searching the presentation and generating an answer..."):
-                # Retrieve relevant presentation excerpts
-                retriever = vector_store.as_retriever(
-                    search_kwargs={"k": 4}
+            if not api_key:
+                st.error(
+                    "Google API key not found. "
+                    "Configure GOOGLE_API_KEY in Streamlit Secrets."
                 )
-                retrieved_docs = retriever.invoke(question)
+                st.stop()
+
+            with st.spinner(
+                "Searching aviation knowledge..."
+            ):
+
+                database = load_database()
+                model = load_model()
+
+                retrieved_docs = database.similarity_search(
+                    question,
+                    k=4,
+                )
 
                 if not retrieved_docs:
-                    st.warning(
-                        "No relevant information was found in the presentation."
+                    answer = (
+                        "I couldn't find relevant information "
+                        "in the available aviation documents."
                     )
-                    st.stop()
 
-                context = "\n\n".join(
-                    doc.page_content for doc in retrieved_docs
-                )
+                else:
+                    context_parts = []
 
-                # Generate a clear answer grounded in the retrieved context
-                model = ChatGoogleGenerativeAI(
-                    model="gemini-3.8-flash",
-                    google_api_key=api_key,
-                    temperature=0.2,
-                )
+                    for index, doc in enumerate(
+                        retrieved_docs,
+                        start=1,
+                    ):
+                        source = doc.metadata.get(
+                            "source",
+                            "Unknown",
+                        )
 
-                prompt = f"""
+                        page = doc.metadata.get(
+                            "page",
+                            "Unknown",
+                        )
+
+                        context_parts.append(
+                            f"[Source {index}: {source}, "
+                            f"page/slide {page}]\n"
+                            f"{doc.page_content}"
+                        )
+
+                    context = "\n\n".join(context_parts)
+
+                    prompt = ChatPromptTemplate.from_messages([
+                        (
+                            "system",
+                            """
 You are AeroRAG, an aviation knowledge assistant.
 
-Answer the user's question using only the presentation excerpts below.
-Write a clear, direct answer in plain text or simple Markdown.
-Do not return JSON, metadata, signatures, or technical formatting.
-If the excerpts do not contain the answer, say that the presentation
-does not provide enough information.
+Answer using the provided aviation context.
 
-PRESENTATION EXCERPTS:
+Rules:
+- Ground factual answers in the supplied context.
+- Do not invent information or citations.
+- If the context is insufficient, say so.
+- Explain concepts clearly and professionally.
+- Do not replace official aviation manuals,
+  instructor guidance, or operational procedures.
+                            """,
+                        ),
+                        (
+                            "human",
+                            """
+Aviation context:
+
 {context}
 
-USER QUESTION:
+Question:
 {question}
 
-Give the answer only.
-"""
+Answer clearly and cite the relevant source numbers.
+                            """,
+                        ),
+                    ])
 
-                response = model.invoke(prompt)
+                    response = (
+                        prompt | model
+                    ).invoke({
+                        "context": context,
+                        "question": question,
+                    })
 
-                # Convert Gemini's response into clean readable text
-                content = response.content
+                    answer = response.content
 
-                if isinstance(content, str):
-                    answer = content
-                elif isinstance(content, list):
-                    text_parts = []
+                    if isinstance(answer, list):
+                        answer = "\n".join(
+                            str(item.get("text", item))
+                            if isinstance(item, dict)
+                            else str(item)
+                            for item in answer
+                        )
 
-                    for item in content:
-                        if isinstance(item, str):
-                            text_parts.append(item)
-                        elif isinstance(item, dict):
-                            if item.get("type") == "text" and item.get("text"):
-                                text_parts.append(item["text"])
+                    with st.expander("Retrieved sources"):
+                        for index, doc in enumerate(
+                            retrieved_docs,
+                            start=1,
+                        ):
+                            source = doc.metadata.get(
+                                "source",
+                                "Unknown",
+                            )
 
-                    answer = "\n".join(text_parts)
-                else:
-                    answer = str(content)
+                            page = doc.metadata.get(
+                                "page",
+                                "Unknown",
+                            )
 
-                st.markdown("### Answer")
-                st.markdown(answer.strip() or "No text answer was returned.")
+                            st.markdown(
+                                f"**Source {index}:** "
+                                f"{source} — page/slide {page}"
+                            )
 
-                with st.expander("View retrieved presentation excerpts"):
-                    for index, doc in enumerate(retrieved_docs, start=1):
-                        st.markdown(f"**Excerpt {index}**")
-                        st.write(doc.page_content)
+                            st.write(doc.page_content[:1000])
+
+            st.markdown(answer)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+            })
 
         except Exception as error:
-            st.error("Sorry, AeroRAG could not answer that question.")
-            st.caption(f"Technical details: {error}")
+            st.error(
+                "AeroRAG encountered an error. "
+                "Check the database, embeddings configuration, "
+                "API key, and deployment logs."
+            )
+
+            st.code(str(error))
+
+
+# ==========================================
+# FOOTER
+# ==========================================
+
+st.divider()
+
+st.caption(
+    "AeroRAG | Aviation Intelligence powered by RAG"
+)
