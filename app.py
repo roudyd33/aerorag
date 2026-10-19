@@ -110,8 +110,16 @@ Question: {question}
 """
                     response = llm.invoke(prompt)
                     st.markdown("### Answer")
-                    st.write(response.content)
+                   answer = response.content
 
+if isinstance(answer, list):
+    answer = "\n".join(
+        item["text"]
+        for item in answer
+        if isinstance(item, dict) and "text" in item
+    )
+
+st.markdown(answer)
                     with st.expander("Retrieved presentation excerpts"):
                         st.write(context)
 
