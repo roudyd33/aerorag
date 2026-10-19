@@ -11,7 +11,71 @@ from langchain_google_genai import (
 )
 
 st.set_page_config(
-    page_title="AeroRAG",
+   # ===== AVIATION BACKGROUND THEME =====
+
+st.markdown("""
+<style>
+/* Full website: dark aviation gradient */
+.stApp {
+    background:
+        radial-gradient(
+            ellipse at 15% 10%,
+            rgba(0, 119, 255, 0.22),
+            transparent 42%
+        ),
+        radial-gradient(
+            ellipse at 85% 85%,
+            rgba(0, 76, 180, 0.18),
+            transparent 45%
+        ),
+        linear-gradient(
+            135deg,
+            #050B16 0%,
+            #0A192B 50%,
+            #071426 100%
+        );
+
+    background-attachment: fixed;
+}
+
+/* Aviation-inspired sidebar */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(
+        180deg,
+        #09172A 0%,
+        #102844 100%
+    );
+
+    border-right: 1px solid rgba(73, 153, 255, 0.25);
+}
+
+/* Transparent top bar */
+.stApp > header {
+    background: transparent;
+}
+
+/* Blue accent headings */
+.stApp h1,
+.stApp h2,
+.stApp h3 {
+    color: #8CCBFF;
+}
+
+/* Subtle blue links */
+.stApp a {
+    color: #68B6FF;
+}
+
+/* Chat panels */
+.stChatMessage {
+    background: rgba(13, 32, 55, 0.72);
+    border: 1px solid rgba(77, 145, 218, 0.20);
+    border-radius: 14px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ===== END AVIATION BACKGROUND ===== page_title="AeroRAG",
     page_icon="✈️",
     layout="wide",
 )
