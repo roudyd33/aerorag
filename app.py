@@ -1,3 +1,4 @@
+```python
 import os
 from pathlib import Path
 
@@ -6,13 +7,29 @@ from pptx import Presentation
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI,
+)
 
-st.set_page_config(page_title="AeroRAG", page_icon="✈️")
+
+# --------------------------------------------------
+# Page configuration
+# --------------------------------------------------
+
+st.set_page_config(
+    page_title="AeroRAG",
+    page_icon="✈️",
+)
 
 st.title("✈️ AeroRAG")
 st.subheader("Aviation Knowledge Assistant")
 st.write("Ask questions based on your aviation presentation.")
+
+
+# --------------------------------------------------
+# API key
+# --------------------------------------------------
 
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
@@ -21,6 +38,11 @@ if not api_key:
     st.stop()
 
 os.environ["GOOGLE_API_KEY"] = api_key
+
+
+# --------------------------------------------------
+# Build vector store
+# --------------------------------------------------
 
 @st.cache_resource
 def build_vector_store():
@@ -33,95 +55,151 @@ def build_vector_store():
         )
 
     presentation = Presentation(str(pptx_files[0]))
+
     docs = []
 
-    for slide_number, slide in enumerate(presentation.slides, start=1):
+    for slide_number, slide in enumerate(
+        presentation.slides,
+        start=1,
+    ):
         text = "\n".join(
-            shape.text for shape in slide.shapes
+            shape.text
+            for shape in slide.shapes
             if shape.has_text_frame and shape.text.strip()
         )
+
         if text.strip():
-            docs.append(Document(
-                page_content=text,
-                metadata={
-                    "source": pptx_files[0].name,
-                    "slide": slide_number
-                }
-            ))
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "source": pptx_files[0].name,
+                        "slide": slide_number,
+                    },
+                )
+            )
 
     if not docs:
-        raise ValueError("No readable text was found in the presentation.")
+        raise ValueError(
+            "No readable text was found in the presentation."
+        )
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
-        chunk_overlap=150
+        chunk_overlap=150,
     )
+
     chunks = splitter.split_documents(docs)
 
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
-        google_api_key=api_key
+        google_api_key=api_key,
     )
 
-    return Chroma.from_documents(
+    vector_store = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name="aviation"
+        collection_name="aviation",
     )
+
+    return vector_store
+
+
+# --------------------------------------------------
+# User question
+# --------------------------------------------------
 
 question = st.text_input(
     "Your aviation question",
-    placeholder="What does a V-n diagram show?"
+    placeholder="What does a V-n diagram show?",
 )
+
+
+# --------------------------------------------------
+# Ask AeroRAG
+# --------------------------------------------------
 
 if st.button("Ask AeroRAG"):
     if not question.strip():
         st.warning("Please enter a question.")
+
     else:
         try:
-            with st.spinner("Searching the presentation and generating an answer..."):
+            with st.spinner(
+                "Searching the presentation and generating an answer..."
+            ):
+                # Build or load vector store
                 vector_store = build_vector_store()
-                results = vector_store.similarity_search(question, k=4)
+
+                # Search for relevant presentation content
+                results = vector_store.similarity_search(
+                    question,
+                    k=4,
+                )
 
                 if not results:
-                    st.warning("I couldn't find relevant information.")
+                    st.warning(
+                        "I couldn't find relevant information."
+                    )
+
                 else:
+                    # Prepare retrieved context
                     context = "\n\n".join(
                         f"Slide {doc.metadata.get('slide', '?')}:\n"
                         f"{doc.page_content}"
                         for doc in results
                     )
 
+                    # Initialize Gemini
                     llm = ChatGoogleGenerativeAI(
                         model="gemini-3.8-flash",
                         temperature=0,
-                        google_api_key=api_key
+                        google_api_key=api_key,
                     )
 
+                    # Create prompt
                     prompt = f"""
 Answer using only the presentation excerpts below.
-If the excerpts do not contain the answer, say you cannot find it.
+
+If the excerpts do not contain the answer,
+say that you cannot find the answer in the presentation.
+
 Mention slide numbers when possible.
 
 Presentation excerpts:
+
 {context}
 
-Question: {question}
+Question:
+{question}
 """
-                   response = llm.invoke(prompt)
 
-answer_text = response.content
+                    # Generate answer
+                    response = llm.invoke(prompt)
 
-if isinstance(answer_text, list):
-    answer_text = "\n".join(
-        item.get("text", "")
-        for item in answer_text
-        if isinstance(item, dict) and item.get("type") == "text"
-    )
+                    answer_text = response.content
 
-st.markdown("### Answer")
-st.markdown(answer_text)
+                    # Handle different response formats
+                    if isinstance(answer_text, list):
+                        answer_text = "\n".join(
+                            item.get("text", "")
+                            for item in answer_text
+                            if isinstance(item, dict)
+                            and item.get("type") == "text"
+                        )
 
-with st.expander("Retrieved presentation excerpts"):
-    st.write(context)
-            st.caption(str(exc))
+                    # Display answer
+                    st.markdown("### Answer")
+                    st.markdown(answer_text)
+
+                    # Display retrieved sources
+                    with st.expander(
+                        "Retrieved presentation excerpts"
+                    ):
+                        st.write(context)
+
+        except Exception as exc:
+            st.error(
+                f"An error occurred: {exc}"
+            )
+```
