@@ -108,13 +108,20 @@ Presentation excerpts:
 
 Question: {question}
 """
-                    response = llm.invoke(prompt)
-                    st.markdown("### Answer")
-                    st.write(response.content)
+                   response = llm.invoke(prompt)
 
-                    with st.expander("Retrieved presentation excerpts"):
-                        st.write(context)
+answer_text = response.content
 
-        except Exception as exc:
-            st.error("The app encountered an error.")
+if isinstance(answer_text, list):
+    answer_text = "\n".join(
+        item.get("text", "")
+        for item in answer_text
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+
+st.markdown("### Answer")
+st.markdown(answer_text)
+
+with st.expander("Retrieved presentation excerpts"):
+    st.write(context)
             st.caption(str(exc))
