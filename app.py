@@ -182,19 +182,23 @@ Question:
 {question}
 """
 
-                    # Generate answer
-                   start_time = time.time()
-logger.info("Received a RAG question")
+              # Generate answer
+                    start_time = time.time()
+                    logger.info("Received a RAG question")
 
-try:
-    response = llm.invoke(prompt)
-    elapsed = time.time() - start_time
-    logger.info("RAG answer generated successfully in %.2f seconds", elapsed)
-
-except Exception:
-    logger.exception("Error while generating RAG answer")
-    st.error("The app encountered an error while generating the answer.")
-    st.stop()
+                    try:
+                        response = llm.invoke(prompt)
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            "RAG answer generated successfully in %.2f seconds",
+                            elapsed,
+                        )
+                    except Exception:
+                        logger.exception("Error while generating RAG answer")
+                        st.error(
+                            "The app encountered an error while generating the answer."
+                        )
+                        st.stop()
 
                     answer_text = response.content
 
@@ -203,22 +207,4 @@ except Exception:
                         answer_text = "\n".join(
                             item.get("text", "")
                             for item in answer_text
-                            if isinstance(item, dict)
-                            and item.get("type") == "text"
                         )
-
-                    # Display answer
-                    st.markdown("### Answer")
-                    st.markdown(answer_text)
-
-                    # Display retrieved sources
-                    with st.expander(
-                        "Retrieved presentation excerpts"
-                    ):
-                        st.write(context)
-
-        except Exception as exc:
-            st.error(
-                f"An error occurred: {exc}"
-            )
-
