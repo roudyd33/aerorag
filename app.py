@@ -1,6 +1,15 @@
 import os
 from pathlib import Path
+import logging
+import time
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    force=True,
+)
+
+logger = logging.getLogger("aerorag")
 import streamlit as st
 from pptx import Presentation
 from langchain_core.documents import Document
@@ -174,7 +183,18 @@ Question:
 """
 
                     # Generate answer
-                    response = llm.invoke(prompt)
+                   start_time = time.time()
+logger.info("Received a RAG question")
+
+try:
+    response = llm.invoke(prompt)
+    elapsed = time.time() - start_time
+    logger.info("RAG answer generated successfully in %.2f seconds", elapsed)
+
+except Exception:
+    logger.exception("Error while generating RAG answer")
+    st.error("The app encountered an error while generating the answer.")
+    st.stop()
 
                     answer_text = response.content
 
