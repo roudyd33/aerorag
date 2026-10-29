@@ -1,7 +1,16 @@
 import os
-from pathlib import Path
-import logging
 import time
+import logging
+from pathlib import Path
+
+import streamlit as st
+from langchain_chroma import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -10,201 +19,379 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("aerorag")
-import streamlit as st
-from pptx import Presentation
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain_google_genai import (
-    GoogleGenerativeAIEmbeddings,
-    ChatGoogleGenerativeAI,
-)
 
-
-# --------------------------------------------------
-# Page configuration
-# --------------------------------------------------
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
-    page_title="AeroRAG",
+    page_title="AeroRAG | Aviation Intelligence",
     page_icon="✈️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-st.title("✈️ AeroRAG")
-st.subheader("Aviation Knowledge Assistant")
-st.write("Ask questions based on your aviation presentation.")
+# ============================================================
+# AVIATION THEME
+# ============================================================
 
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background:
+            radial-gradient(
+                circle at 15% 10%,
+                rgba(0, 110, 255, 0.18),
+                transparent 35%
+            ),
+            linear-gradient(
+                135deg,
+                #06101f 0%,
+                #0a192d 50%,
+                #071222 100%
+            );
+        color: #edf5ff;
+    }
 
-# --------------------------------------------------
-# API key
-# --------------------------------------------------
+    [data-testid="stHeader"] {
+        background: rgba(4, 12, 25, 0.85);
+    }
 
-api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    .block-container {
+        max-width: 1100px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
 
-if not api_key:
-    st.error("Gemini API key is not configured.")
-    st.stop()
+    .hero {
+        padding: 2rem;
+        border: 1px solid rgba(75, 155, 255, 0.35);
+        border-radius: 20px;
+        background: linear-gradient(
+            135deg,
+            rgba(15, 43, 76, 0.95),
+            rgba(5, 19, 38, 0.95)
+        );
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+        margin-bottom: 1.5rem;
+    }
 
-os.environ["GOOGLE_API_KEY"] = api_key
+    .hero h1 {
+        color: #ffffff;
+        font-size: 2.5rem;
+        margin-bottom: 0.4rem;
+    }
 
+    .hero p {
+        color: #a9c9ef;
+        font-size: 1rem;
+    }
 
-# --------------------------------------------------
-# Build vector store
-# --------------------------------------------------
+    .status {
+        display: inline-block;
+        padding: 0.35rem 0.75rem;
+        border-radius: 30px;
+        border: 1px solid rgba(56, 189, 248, 0.45);
+        background: rgba(14, 116, 180, 0.18);
+        color: #7dd3fc;
+        font-size: 0.8rem;
+        margin-bottom: 0.8rem;
+    }
+
+    div[data-testid="stTextInput"] input {
+        background: #0c1b30;
+        color: #ffffff;
+        border: 1px solid #315780;
+        border-radius: 10px;
+    }
+
+    div[data-testid="stButton"] button {
+        background: linear-gradient(90deg, #0877ee, #16a5ff);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        font-weight: 600;
+        min-height: 2.8rem;
+    }
+
+    div[data-testid="stButton"] button:hover {
+        border: 1px solid #8ac5ff;
+        color: white;
+    }
+
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li {
+        color: #e1edff;
+        line-height: 1.7;
+    }
+
+    hr {
+        border-color: rgba(100, 160, 230, 0.22);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    """
+    <div class="hero">
+        <div class="status">● AVIATION AI SYSTEM</div>
+        <h1>✈ AeroRAG</h1>
+        <p>
+            Aviation knowledge retrieval powered by Retrieval-Augmented
+            Generation. Ask questions about your aviation presentations
+            and receive answers grounded in retrieved content.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DB_PATH = os.getenv("CHROMA_DB_PATH", "chroma_db_local")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "aviation")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+EMBEDDING_MODEL = os.getenv(
+    "GEMINI_EMBEDDING_MODEL",
+    "models/gemini-embedding-001",
+)
+
+# ============================================================
+# LOAD RAG COMPONENTS
+# ============================================================
 
 @st.cache_resource
-def build_vector_store():
-    docs_dir = Path("documents")
-    pptx_files = list(docs_dir.glob("*.pptx"))
+def load_rag_components():
+    api_key = os.getenv("GOOGLE_API_KEY")
 
-    if not pptx_files:
-        raise FileNotFoundError(
-            "No PowerPoint file found in the documents folder."
+    if not api_key:
+        try:
+            api_key = st.secrets.get("GOOGLE_API_KEY")
+        except Exception:
+            api_key = None
+
+    if not api_key:
+        raise RuntimeError(
+            "GOOGLE_API_KEY is not configured. Add it to "
+            "Streamlit Cloud secrets."
         )
 
-    presentation = Presentation(str(pptx_files[0]))
+    db_directory = Path(DB_PATH)
 
-    docs = []
-
-    for slide_number, slide in enumerate(
-        presentation.slides,
-        start=1,
-    ):
-        text = "\n".join(
-            shape.text
-            for shape in slide.shapes
-            if shape.has_text_frame and shape.text.strip()
+    if not db_directory.exists():
+        raise RuntimeError(
+            f"Chroma database directory not found: {DB_PATH}"
         )
-
-        if text.strip():
-            docs.append(
-                Document(
-                    page_content=text,
-                    metadata={
-                        "source": pptx_files[0].name,
-                        "slide": slide_number,
-                    },
-                )
-            )
-
-    if not docs:
-        raise ValueError(
-            "No readable text was found in the presentation."
-        )
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150,
-    )
-
-    chunks = splitter.split_documents(docs)
 
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
+        model=EMBEDDING_MODEL,
         google_api_key=api_key,
     )
 
-    vector_store = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name="aviation",
+    vectorstore = Chroma(
+        collection_name=COLLECTION_NAME,
+        persist_directory=DB_PATH,
+        embedding_function=embeddings,
     )
 
-    return vector_store
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME,
+        google_api_key=api_key,
+        temperature=0.2,
+    )
+
+    logger.info("AeroRAG components initialized successfully")
+
+    return vectorstore, llm
 
 
-# --------------------------------------------------
-# User question
-# --------------------------------------------------
+# ============================================================
+# QUESTION INPUT
+# ============================================================
+
+st.markdown("### Aviation Knowledge Assistant")
 
 question = st.text_input(
-    "Your aviation question",
-    placeholder="What does a V-n diagram show?",
+    "Ask an aviation question",
+    placeholder="Example: What does the maneuver envelope represent?",
+    key="aviation_question",
 )
 
+ask_button = st.button("Ask AeroRAG", use_container_width=True)
 
-# --------------------------------------------------
-# Ask AeroRAG
-# --------------------------------------------------
+# ============================================================
+# RETRIEVAL AND ANSWER GENERATION
+# ============================================================
 
-if st.button("Ask AeroRAG"):
+if ask_button:
     if not question.strip():
-        st.warning("Please enter a question.")
+        st.warning("Please enter a question first.")
 
     else:
         try:
-            with st.spinner(
-                "Searching the presentation and generating an answer..."
-            ):
-                # Build or load vector store
-                vector_store = build_vector_store()
+            logger.info("Received a RAG question")
 
-                # Search for relevant presentation content
-                results = vector_store.similarity_search(
+            with st.spinner("Searching aviation knowledge..."):
+                vectorstore, llm = load_rag_components()
+
+                retrieval_start = time.time()
+
+                retrieved_docs = vectorstore.similarity_search(
                     question,
                     k=4,
                 )
 
-                if not results:
+                retrieval_elapsed = time.time() - retrieval_start
+
+                logger.info(
+                    "Retrieved %d documents in %.2f seconds",
+                    len(retrieved_docs),
+                    retrieval_elapsed,
+                )
+
+                if not retrieved_docs:
                     st.warning(
-                        "I couldn't find relevant information."
+                        "No relevant presentation excerpts were found."
+                    )
+                    st.stop()
+
+                context_parts = []
+
+                for index, doc in enumerate(retrieved_docs, start=1):
+                    metadata = doc.metadata or {}
+                    slide = metadata.get("slide")
+
+                    if slide is None:
+                        slide = metadata.get("slide_number")
+
+                    slide_label = (
+                        f"Slide {slide}"
+                        if slide is not None
+                        else f"Excerpt {index}"
                     )
 
-                else:
-                    # Prepare retrieved context
-                    context = "\n\n".join(
-                        f"Slide {doc.metadata.get('slide', '?')}:\n"
-                        f"{doc.page_content}"
-                        for doc in results
+                    context_parts.append(
+                        f"{slide_label}:\n{doc.page_content}"
                     )
 
-                    # Initialize Gemini
-                    llm = ChatGoogleGenerativeAI(
-                        model="gemini-3.8-flash",
-                        temperature=0,
-                        google_api_key=api_key,
-                    )
+                context = "\n\n".join(context_parts)
 
-                    # Create prompt
-                    prompt = f"""
-Answer using only the presentation excerpts below.
+                prompt = ChatPromptTemplate.from_template(
+                    """
+You are AeroRAG, an aviation knowledge assistant.
 
-If the excerpts do not contain the answer,
-say that you cannot find the answer in the presentation.
+Answer the user's question using only the presentation excerpts
+provided below.
 
-Mention slide numbers when possible.
+Instructions:
+- Give a clear, direct, professional answer.
+- Mention slide numbers when possible.
+- Do not invent aviation facts that are not supported by the excerpts.
+- If the excerpts do not contain enough information, say so.
+- Keep the answer easy to understand.
 
 Presentation excerpts:
-
 {context}
 
 Question:
 {question}
 """
+                )
 
-              # Generate answer
-                    start_time = time.time()
-                    logger.info("Received a RAG question")
+                formatted_prompt = prompt.format_messages(
+                    context=context,
+                    question=question,
+                )
 
-                    try:
-                        response = llm.invoke(prompt)
-                        elapsed = time.time() - start_time
-                        logger.info(
-                            "RAG answer generated successfully in %.2f seconds",
-                            elapsed,
+                generation_start = time.time()
+
+                try:
+                    response = llm.invoke(formatted_prompt)
+
+                    generation_elapsed = (
+                        time.time() - generation_start
+                    )
+
+                    logger.info(
+                        "RAG answer generated successfully in %.2f seconds",
+                        generation_elapsed,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Error while generating RAG answer"
+                    )
+                    st.error(
+                        "The app encountered an error while generating "
+                        "the answer. Check the application logs."
+                    )
+                    st.stop()
+
+                answer_text = response.content
+
+                if isinstance(answer_text, list):
+                    answer_text = "\n".join(
+                        item.get("text", "")
+                        if isinstance(item, dict)
+                        else str(item)
+                        for item in answer_text
+                    )
+
+                if not isinstance(answer_text, str):
+                    answer_text = str(answer_text)
+
+                st.markdown("### Answer")
+                st.markdown(answer_text)
+
+                with st.expander("Retrieved presentation excerpts"):
+                    for index, doc in enumerate(
+                        retrieved_docs,
+                        start=1,
+                    ):
+                        metadata = doc.metadata or {}
+                        slide = metadata.get("slide")
+
+                        if slide is None:
+                            slide = metadata.get("slide_number")
+
+                        heading = (
+                            f"Slide {slide}"
+                            if slide is not None
+                            else f"Excerpt {index}"
                         )
-                    except Exception:
-                        logger.exception("Error while generating RAG answer")
-                        st.error(
-                            "The app encountered an error while generating the answer."
-                        )
-                        st.stop()
 
-                    answer_text = response.content
+                        st.markdown(f"**{heading}**")
+                        st.write(doc.page_content)
 
-                    # Handle different response formats
-                    if isinstance(answer_text, list):
-                        answer_text = "\n".join(
-                            item.get("text", "")
-                            for item in answer_text
-                        )
+                logger.info(
+                    "Question completed successfully"
+                )
+
+        except Exception:
+            logger.exception(
+                "Unexpected error in the AeroRAG request workflow"
+            )
+            st.error(
+                "AeroRAG encountered an unexpected error. "
+                "Check the Streamlit Cloud logs for details."
+            )
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "AeroRAG | Aviation Intelligence | "
+    "Retrieval-Augmented Generation"
+)
