@@ -204,7 +204,6 @@ def find_presentation():
         project_dir / "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
     ]
 
-    # Also accept another PPTX placed directly in documents/.
     documents_dir = project_dir / "documents"
 
     if documents_dir.exists():
@@ -212,7 +211,6 @@ def find_presentation():
             sorted(documents_dir.glob("*.pptx"))
         )
 
-    # Also accept a PPTX in the project root.
     candidates.extend(sorted(project_dir.glob("*.pptx")))
 
     for candidate in candidates:
@@ -292,10 +290,6 @@ def load_presentation_documents(presentation_path):
 def load_rag_components():
     """
     Build a cloud-side Chroma database from the PPTX.
-
-    This deliberately creates a new database using Google
-    embeddings instead of reusing a potentially incompatible
-    local Ollama-embedding database.
     """
 
     api_key = get_api_key()
@@ -324,9 +318,9 @@ def load_rag_components():
         google_api_key=api_key,
     )
 
-    # Use a new temporary database for this running app instance.
-    # It is recreated from the PPTX when the app starts afresh.
-    database_path = tempfile.mkdtemp(prefix="aerorag_chroma_")
+    database_path = tempfile.mkdtemp(
+        prefix="aerorag_chroma_"
+    )
 
     vectorstore = Chroma.from_documents(
         documents=chunks,
@@ -346,6 +340,84 @@ def load_rag_components():
     )
 
     return vectorstore, llm
+
+
+# ============================================================
+# GEMINI RETRY FUNCTION
+# ============================================================
+
+def generate_answer_with_retry(llm, prompt, max_attempts=3):
+    """
+    Generate an answer with retries for temporary Gemini errors.
+
+    Retry delays:
+    Attempt 1 failure: wait 2 seconds.
+    Attempt 2 failure: wait 4 seconds.
+    Attempt 3 failure: report the error.
+    """
+
+    for attempt in range(max_attempts):
+
+        try:
+            logger.info(
+                "Gemini generation attempt %s/%s",
+                attempt + 1,
+                max_attempts,
+            )
+
+            response = llm.invoke(prompt)
+
+            logger.info("Gemini generated an answer successfully")
+
+            return response
+
+        except Exception as exc:
+
+            error_message = str(exc).upper()
+
+            temporary_error = any(
+                error in error_message
+                for error in [
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "500",
+                    "INTERNAL",
+                    "502",
+                    "504",
+                    "DEADLINE_EXCEEDED",
+                ]
+            )
+
+            if temporary_error and attempt < max_attempts - 1:
+
+                wait_seconds = 2 ** (attempt + 1)
+
+                logger.warning(
+                    "Gemini temporarily unavailable. "
+                    "Retrying in %s seconds. Attempt %s/%s",
+                    wait_seconds,
+                    attempt + 1,
+                    max_attempts,
+                )
+
+                time.sleep(wait_seconds)
+
+            else:
+
+                logger.exception(
+                    "Error while generating the RAG answer"
+                )
+
+                if temporary_error:
+                    raise RuntimeError(
+                        "Gemini is temporarily unavailable or "
+                        "experiencing high demand. Please try again "
+                        "in a few minutes."
+                    ) from exc
+
+                raise
 
 
 # ============================================================
@@ -370,10 +442,12 @@ ask_button = st.button(
 # ============================================================
 
 if ask_button:
+
     if not question.strip():
         st.warning("Please enter a question first.")
 
     else:
+
         try:
             logger.info("Received a RAG question")
 
@@ -383,6 +457,7 @@ if ask_button:
                 vectorstore, llm = load_rag_components()
 
             with st.spinner("Searching aviation knowledge..."):
+
                 retrieval_start = time.time()
 
                 retrieved_docs = vectorstore.similarity_search(
@@ -408,6 +483,7 @@ if ask_button:
                 retrieved_docs,
                 start=1,
             ):
+
                 metadata = doc.metadata or {}
                 slide = metadata.get("slide")
 
@@ -445,20 +521,44 @@ Question:
 Answer:
 """
 
-            with st.spinner("Generating your answer..."):
+            # ====================================================
+            # GEMINI ANSWER GENERATION WITH AUTOMATIC RETRIES
+            # ====================================================
+
+            with st.spinner(
+                "Generating your answer..."
+            ):
+
                 generation_start = time.time()
 
                 try:
-                    response = llm.invoke(prompt)
+                    response = generate_answer_with_retry(
+                        llm,
+                        prompt,
+                        max_attempts=3,
+                    )
+
+                except RuntimeError as exc:
+
+                    st.warning(str(exc))
+                    st.info(
+                        "Your aviation database is still available. "
+                        "Please try asking your question again later."
+                    )
+
+                    st.stop()
 
                 except Exception:
+
                     logger.exception(
-                        "Error while generating the RAG answer"
+                        "Unexpected Gemini generation failure"
                     )
+
                     st.error(
-                        "The AI model could not generate an answer. "
-                        "Check the model name, API key, and Cloud logs."
+                        "AeroRAG encountered an unexpected error "
+                        "while generating your answer."
                     )
+
                     st.stop()
 
                 logger.info(
@@ -466,9 +566,14 @@ Answer:
                     time.time() - generation_start,
                 )
 
+            # ====================================================
+            # CLEAN AND DISPLAY ANSWER
+            # ====================================================
+
             answer_text = response.content
 
             if isinstance(answer_text, list):
+
                 answer_text = "\n".join(
                     item.get("text", "")
                     if isinstance(item, dict)
@@ -482,11 +587,19 @@ Answer:
             st.markdown("### Answer")
             st.markdown(answer_text)
 
-            with st.expander("Retrieved presentation excerpts"):
+            # ====================================================
+            # RETRIEVED PRESENTATION EXCERPTS
+            # ====================================================
+
+            with st.expander(
+                "Retrieved presentation excerpts"
+            ):
+
                 for index, doc in enumerate(
                     retrieved_docs,
                     start=1,
                 ):
+
                     metadata = doc.metadata or {}
                     slide = metadata.get("slide")
 
@@ -502,11 +615,17 @@ Answer:
             logger.info("Question completed successfully")
 
         except Exception as exc:
+
             logger.exception(
                 "Unexpected error in the AeroRAG workflow"
             )
-            st.error("AeroRAG could not complete your request.")
+
+            st.error(
+                "AeroRAG could not complete your request."
+            )
+
             st.caption(str(exc))
+
 
 # ============================================================
 # FOOTER
