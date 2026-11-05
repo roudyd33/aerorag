@@ -5,7 +5,6 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
-
 from pptx import Presentation
 
 from langchain_core.documents import Document
@@ -16,6 +15,7 @@ from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
 )
+
 
 # ============================================================
 # 1. LOGGING
@@ -29,6 +29,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("aerorag")
 
+
 # ============================================================
 # 2. PAGE CONFIGURATION
 # ============================================================
@@ -39,6 +40,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
 
 # ============================================================
 # 3. AVIATION THEME
@@ -143,6 +145,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ============================================================
 # 4. HEADER
 # ============================================================
@@ -163,6 +166,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ============================================================
 # 5. CONFIGURATION
 # ============================================================
@@ -181,61 +185,130 @@ RETRIEVAL_COUNT = 4
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
+MAX_RETRY_ATTEMPTS = 4
+
+
 # ============================================================
-# 6. ERROR CLASSIFICATION
+# 6. CUSTOM ERRORS
 # ============================================================
 
-def is_temporary_error(exc):
+class DailyQuotaExceededError(Exception):
+    """Raised when Google's daily API quota is exhausted."""
+
+
+class RateLimitError(Exception):
+    """Raised when an API rate limit prevents the request."""
+
+
+# ============================================================
+# 7. ERROR CLASSIFICATION
+# ============================================================
+
+def get_error_message(exc):
+    """Read the exception and its chained causes."""
+
+    messages = []
+    current = exc
+    visited = set()
+
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+
+    return " ".join(messages).lower()
+
+
+def is_daily_quota_error(exc):
     """
-    Identify errors that may recover after waiting.
+    Detect daily quota exhaustion.
 
-    Note: Some 429 quota errors are not temporary.
-    Those should be resolved through quota or billing settings.
+    These errors cannot be fixed by retrying.
     """
 
-    message = str(exc).upper()
+    message = get_error_message(exc)
 
-    permanent_quota_messages = [
-        "QUOTA EXCEEDED",
-        "PER DAY",
-        "DAILY LIMIT",
-        "BILLING NOT ENABLED",
-    ]
-
-    if any(item in message for item in permanent_quota_messages):
-        return False
-
-    temporary_indicators = [
-        "503",
-        "UNAVAILABLE",
-        "429",
-        "RESOURCE_EXHAUSTED",
-        "500",
-        "INTERNAL",
-        "502",
-        "504",
-        "DEADLINE_EXCEEDED",
-        "TIMEOUT",
-        "CONNECTION RESET",
-        "SERVICE UNAVAILABLE",
+    daily_quota_indicators = [
+        "generate_content_free_tier_requests",
+        "generaterequestsperday",
+        "requests per day",
+        "per day per model",
+        "daily limit",
+        "daily quota",
+        "per-day quota",
+        "quota_value",
     ]
 
     return any(
-        item in message
-        for item in temporary_indicators
+        indicator in message
+        for indicator in daily_quota_indicators
     )
 
+
+def is_rate_limit_error(exc):
+    """Detect HTTP 429 and resource exhaustion errors."""
+
+    message = get_error_message(exc)
+
+    return (
+        "429" in message
+        or "resource_exhausted" in message
+        or "rate limit" in message
+    )
+
+
+def is_temporary_error(exc):
+    """
+    Only classify errors likely to recover after waiting.
+
+    Daily quota and rate-limit errors are deliberately excluded.
+    """
+
+    if is_daily_quota_error(exc):
+        return False
+
+    if is_rate_limit_error(exc):
+        return False
+
+    message = get_error_message(exc)
+
+    temporary_indicators = [
+        "503",
+        "service unavailable",
+        "500",
+        "internal server error",
+        "502",
+        "504",
+        "deadline_exceeded",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection error",
+        "temporarily unavailable",
+    ]
+
+    return any(
+        indicator in message
+        for indicator in temporary_indicators
+    )
+
+
+# ============================================================
+# 8. RETRY HANDLER
+# ============================================================
 
 def retry_operation(
     operation,
     operation_name,
-    max_attempts=5,
+    max_attempts=MAX_RETRY_ATTEMPTS,
 ):
     """
-    Retry an operation after temporary API failures.
+    Retry temporary failures only.
 
-    Wait schedule:
-    3, 6, 12, 24 seconds.
+    Important:
+    - Daily quota errors are never retried.
+    - 429 errors are never retried automatically.
+    - Temporary server errors use exponential backoff.
     """
 
     for attempt in range(max_attempts):
@@ -259,30 +332,72 @@ def retry_operation(
 
         except Exception as exc:
 
-            if (
-                not is_temporary_error(exc)
-                or attempt == max_attempts - 1
-            ):
-                logger.exception(
-                    "%s failed",
+            # Daily quota: stop immediately.
+            if is_daily_quota_error(exc):
+
+                logger.error(
+                    "%s stopped because the daily Google API quota "
+                    "has been exhausted.",
                     operation_name,
                 )
+
+                raise DailyQuotaExceededError(
+                    "Google's daily API quota has been exhausted. "
+                    "Wait for the quota reset or use an API "
+                    "configuration with available quota."
+                ) from exc
+
+            # Other rate limits: do not retry automatically.
+            if is_rate_limit_error(exc):
+
+                logger.error(
+                    "%s stopped because Google returned a "
+                    "429 rate-limit/resource-exhausted error.",
+                    operation_name,
+                )
+
+                raise RateLimitError(
+                    "Google temporarily rejected the request "
+                    "because an API rate limit was reached. "
+                    "Please wait before trying again."
+                ) from exc
+
+            # Non-temporary errors: stop immediately.
+            if not is_temporary_error(exc):
+
+                logger.exception(
+                    "%s failed with a non-retryable error.",
+                    operation_name,
+                )
+
                 raise
 
-            wait_seconds = 3 * (2 ** attempt)
+            # Temporary error: retry if attempts remain.
+            if attempt < max_attempts - 1:
 
-            logger.warning(
-                "%s temporarily failed. "
-                "Retrying in %s seconds. "
-                "Attempt %s/%s. Error: %s",
-                operation_name,
-                wait_seconds,
-                attempt + 1,
-                max_attempts,
-                str(exc),
-            )
+                wait_seconds = 3 * (2 ** attempt)
 
-            time.sleep(wait_seconds)
+                logger.warning(
+                    "%s temporarily failed. "
+                    "Retrying in %s seconds. "
+                    "Attempt %s/%s. Error: %s",
+                    operation_name,
+                    wait_seconds,
+                    attempt + 1,
+                    max_attempts,
+                    str(exc),
+                )
+
+                time.sleep(wait_seconds)
+
+            else:
+
+                logger.exception(
+                    "%s failed after all retry attempts.",
+                    operation_name,
+                )
+
+                raise
 
     raise RuntimeError(
         f"{operation_name} failed after all retry attempts."
@@ -290,7 +405,7 @@ def retry_operation(
 
 
 # ============================================================
-# 7. API KEY
+# 9. API KEY
 # ============================================================
 
 def get_api_key():
@@ -314,34 +429,29 @@ def get_api_key():
 
 
 # ============================================================
-# 8. FIND POWERPOINT
+# 10. FIND POWERPOINT
 # ============================================================
 
 def find_presentation():
     """Find the aviation PowerPoint."""
 
     project_dir = Path(__file__).resolve().parent
-
     documents_dir = project_dir / "documents"
 
     candidates = [
-        documents_dir /
-        "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
-
-        project_dir /
-        "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
+        documents_dir / "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
+        project_dir / "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
     ]
 
     if documents_dir.exists():
-        candidates.extend(
-            sorted(documents_dir.glob("*.pptx"))
-        )
+        candidates.extend(sorted(documents_dir.glob("*.pptx")))
 
-    candidates.extend(
-        sorted(project_dir.glob("*.pptx"))
-    )
+    candidates.extend(sorted(project_dir.glob("*.pptx")))
 
-    for candidate in candidates:
+    # Remove duplicate paths while preserving order.
+    unique_candidates = list(dict.fromkeys(candidates))
+
+    for candidate in unique_candidates:
 
         if candidate.is_file():
 
@@ -360,14 +470,13 @@ def find_presentation():
 
 
 # ============================================================
-# 9. EXTRACT POWERPOINT CONTENT
+# 11. EXTRACT POWERPOINT CONTENT
 # ============================================================
 
 def load_presentation_documents(presentation_path):
-    """Extract readable slide text and preserve slide numbers."""
+    """Extract slide text and preserve slide numbers."""
 
     presentation = Presentation(str(presentation_path))
-
     documents = []
 
     for slide_number, slide in enumerate(
@@ -397,13 +506,9 @@ def load_presentation_documents(presentation_path):
                     ]
 
                     if cells:
-                        slide_text.append(
-                            " | ".join(cells)
-                        )
+                        slide_text.append(" | ".join(cells))
 
-        combined_text = "\n".join(
-            slide_text
-        ).strip()
+        combined_text = "\n".join(slide_text).strip()
 
         if combined_text:
 
@@ -418,14 +523,13 @@ def load_presentation_documents(presentation_path):
             )
 
     if not documents:
-
         raise RuntimeError(
             "The PowerPoint was found, but no readable "
             "slide text could be extracted."
         )
 
     logger.info(
-        "Extracted text from %s slides",
+        "Extracted text from %s slides.",
         len(documents),
     )
 
@@ -433,16 +537,20 @@ def load_presentation_documents(presentation_path):
 
 
 # ============================================================
-# 10. BUILD RAG COMPONENTS
+# 12. BUILD RAG COMPONENTS
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def load_rag_components():
     """
-    Build the Chroma database and initialize Gemini.
+    Initialize the presentation, embeddings, Chroma database,
+    and Gemini language model.
 
-    The resource is cached during the running Streamlit process.
+    Streamlit caches these components during the running
+    application session to avoid rebuilding them on every question.
     """
+
+    logger.info("Starting AeroRAG initialization.")
 
     api_key = get_api_key()
 
@@ -457,18 +565,15 @@ def load_rag_components():
         chunk_overlap=CHUNK_OVERLAP,
     )
 
-    chunks = splitter.split_documents(
-        slide_documents
-    )
+    chunks = splitter.split_documents(slide_documents)
 
     if not chunks:
-
         raise RuntimeError(
-            "No text chunks could be created."
+            "No text chunks could be created from the presentation."
         )
 
     logger.info(
-        "Created %s presentation chunks",
+        "Created %s presentation chunks.",
         len(chunks),
     )
 
@@ -478,9 +583,6 @@ def load_rag_components():
     )
 
     def create_vectorstore():
-        """
-        Create a fresh temporary database for each build attempt.
-        """
 
         database_path = tempfile.mkdtemp(
             prefix="aerorag_chroma_"
@@ -496,7 +598,6 @@ def load_rag_components():
     vectorstore = retry_operation(
         create_vectorstore,
         operation_name="Chroma database creation",
-        max_attempts=4,
     )
 
     llm = ChatGoogleGenerativeAI(
@@ -506,18 +607,18 @@ def load_rag_components():
     )
 
     logger.info(
-        "AeroRAG components initialized successfully"
+        "AeroRAG components initialized successfully."
     )
 
     return vectorstore, llm
 
 
 # ============================================================
-# 11. RETRIEVE RELEVANT INFORMATION
+# 13. RETRIEVE RELEVANT INFORMATION
 # ============================================================
 
 def retrieve_documents(vectorstore, question):
-    """Search ChromaDB with retry handling."""
+    """Search ChromaDB for relevant presentation excerpts."""
 
     return retry_operation(
         lambda: vectorstore.similarity_search(
@@ -525,30 +626,28 @@ def retrieve_documents(vectorstore, question):
             k=RETRIEVAL_COUNT,
         ),
         operation_name="Document retrieval",
-        max_attempts=4,
     )
 
 
 # ============================================================
-# 12. GENERATE ANSWER
+# 14. GENERATE ANSWER
 # ============================================================
 
 def generate_answer_with_retry(llm, prompt):
-    """Generate a Gemini answer with temporary-error retries."""
+    """Generate an answer using Gemini."""
 
     return retry_operation(
         lambda: llm.invoke(prompt),
         operation_name="Gemini answer generation",
-        max_attempts=5,
     )
 
 
 # ============================================================
-# 13. PREPARE CONTEXT
+# 15. PREPARE CONTEXT
 # ============================================================
 
 def prepare_context(retrieved_docs):
-    """Prepare retrieved excerpts and preserve slide references."""
+    """Prepare retrieved excerpts with slide references."""
 
     context_parts = []
 
@@ -558,7 +657,6 @@ def prepare_context(retrieved_docs):
     ):
 
         metadata = doc.metadata or {}
-
         slide = metadata.get("slide")
 
         label = (
@@ -575,7 +673,7 @@ def prepare_context(retrieved_docs):
 
 
 # ============================================================
-# 14. CLEAN MODEL RESPONSE
+# 16. CLEAN MODEL RESPONSE
 # ============================================================
 
 def clean_answer(response):
@@ -592,9 +690,7 @@ def clean_answer(response):
             if isinstance(item, dict):
 
                 if item.get("type") == "text":
-                    text_parts.append(
-                        item.get("text", "")
-                    )
+                    text_parts.append(item.get("text", ""))
 
             else:
                 text_parts.append(str(item))
@@ -615,7 +711,62 @@ def clean_answer(response):
 
 
 # ============================================================
-# 15. QUESTION INPUT
+# 17. DISPLAY ERROR MESSAGE
+# ============================================================
+
+def display_service_error(exc, operation):
+    """Display a user-friendly error without exposing a traceback."""
+
+    if isinstance(exc, DailyQuotaExceededError) or is_daily_quota_error(exc):
+
+        st.error("Gemini's daily API quota has been exhausted.")
+
+        st.info(
+            "The Google AI free-tier daily request limit has been "
+            "reached. Retrying will not restore the quota. "
+            "Please wait for the quota reset or configure an "
+            "API setup with available quota."
+        )
+
+        st.caption(
+            "Your PowerPoint presentation and RAG architecture "
+            "are not deleted by this error."
+        )
+
+    elif isinstance(exc, RateLimitError) or is_rate_limit_error(exc):
+
+        st.warning("Google AI has temporarily rate-limited the request.")
+
+        st.info(
+            "Please wait before submitting another question. "
+            "Repeated requests may continue to be rejected."
+        )
+
+    elif is_temporary_error(exc):
+
+        st.warning(
+            f"A temporary service problem occurred during {operation}."
+        )
+
+        st.info(
+            "AeroRAG can retry temporary server and connection "
+            "failures. Please try again later if the problem continues."
+        )
+
+    else:
+
+        st.error(
+            f"AeroRAG encountered a problem during {operation}."
+        )
+
+        st.info(
+            "Check your Google API key, model configuration, "
+            "PowerPoint file, dependencies, and Streamlit Cloud logs."
+        )
+
+
+# ============================================================
+# 18. QUESTION INPUT
 # ============================================================
 
 st.markdown(
@@ -635,8 +786,9 @@ ask_button = st.button(
     use_container_width=True,
 )
 
+
 # ============================================================
-# 16. MAIN RAG WORKFLOW
+# 19. MAIN RAG WORKFLOW
 # ============================================================
 
 if ask_button:
@@ -650,7 +802,8 @@ if ask_button:
     else:
 
         logger.info(
-            "New question received"
+            "New question received: %s",
+            question,
         )
 
         retrieved_docs = []
@@ -670,27 +823,13 @@ if ask_button:
         except Exception as exc:
 
             logger.exception(
-                "RAG initialization failed"
+                "RAG initialization failed."
             )
 
-            st.error(
-                "AeroRAG could not initialize its database "
-                "or AI services."
+            display_service_error(
+                exc,
+                "database initialization",
             )
-
-            if is_temporary_error(exc):
-
-                st.warning(
-                    "A Google AI service may be temporarily "
-                    "unavailable. Please try again later."
-                )
-
-            else:
-
-                st.info(
-                    "Check your API key, PowerPoint file, "
-                    "dependencies, and Streamlit Cloud logs."
-                )
 
             st.stop()
 
@@ -712,7 +851,7 @@ if ask_button:
                 )
 
                 logger.info(
-                    "Retrieved %s documents in %.2f seconds",
+                    "Retrieved %s documents in %.2f seconds.",
                     len(retrieved_docs),
                     time.time() - retrieval_start,
                 )
@@ -720,26 +859,17 @@ if ask_button:
         except Exception as exc:
 
             logger.exception(
-                "Document retrieval failed"
+                "Document retrieval failed."
             )
 
             st.error(
                 "AeroRAG could not search the aviation database."
             )
 
-            if is_temporary_error(exc):
-
-                st.warning(
-                    "The Google embedding service may be "
-                    "temporarily unavailable. Please try again."
-                )
-
-            else:
-
-                st.info(
-                    "Check the embedding configuration and "
-                    "database initialization in the logs."
-                )
+            display_service_error(
+                exc,
+                "document retrieval",
+            )
 
             st.stop()
 
@@ -755,9 +885,7 @@ if ask_button:
 
             st.stop()
 
-        context = prepare_context(
-            retrieved_docs
-        )
+        context = prepare_context(retrieved_docs)
 
         # ----------------------------------------------------
         # STEP D: DISPLAY RETRIEVED INFORMATION
@@ -774,7 +902,6 @@ if ask_button:
             ):
 
                 metadata = doc.metadata or {}
-
                 slide = metadata.get("slide")
 
                 heading = (
@@ -783,13 +910,8 @@ if ask_button:
                     else f"Excerpt {index}"
                 )
 
-                st.markdown(
-                    f"**{heading}**"
-                )
-
-                st.write(
-                    doc.page_content
-                )
+                st.markdown(f"**{heading}**")
+                st.write(doc.page_content)
 
         # ----------------------------------------------------
         # STEP E: PREPARE PROMPT
@@ -840,12 +962,10 @@ ANSWER:
                     prompt,
                 )
 
-                answer_text = clean_answer(
-                    response
-                )
+                answer_text = clean_answer(response)
 
                 logger.info(
-                    "Answer generated in %.2f seconds",
+                    "Answer generated in %.2f seconds.",
                     time.time() - generation_start,
                 )
 
@@ -853,26 +973,22 @@ ANSWER:
             # STEP G: DISPLAY FINAL ANSWER
             # ------------------------------------------------
 
-            st.markdown(
-                "### Answer"
-            )
+            st.markdown("### Answer")
 
-            st.markdown(
-                answer_text
-            )
+            st.markdown(answer_text)
 
             st.success(
                 "Answer generated successfully."
             )
 
             logger.info(
-                "Question completed successfully"
+                "Question completed successfully."
             )
 
         except Exception as exc:
 
             logger.exception(
-                "Answer generation failed"
+                "Answer generation failed."
             )
 
             st.warning(
@@ -881,28 +997,14 @@ ANSWER:
                 "generate an answer."
             )
 
-            if is_temporary_error(exc):
-
-                st.info(
-                    "Gemini is temporarily unavailable or "
-                    "experiencing high demand. "
-                    "Your retrieved aviation excerpts are "
-                    "still available above. Please try again later."
-                )
-
-            else:
-
-                st.error(
-                    "An error occurred during answer generation."
-                )
-
-                st.caption(
-                    "Check the Streamlit Cloud logs for details."
-                )
+            display_service_error(
+                exc,
+                "answer generation",
+            )
 
 
 # ============================================================
-# 17. FOOTER
+# 20. FOOTER
 # ============================================================
 
 st.divider()
