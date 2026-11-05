@@ -5,18 +5,20 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
+
 from pptx import Presentation
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
+
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
 )
 
 # ============================================================
-# LOGGING
+# 1. LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -28,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("aerorag")
 
 # ============================================================
-# PAGE CONFIGURATION
+# 2. PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -39,7 +41,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# AVIATION THEME
+# 3. AVIATION THEME
 # ============================================================
 
 st.markdown(
@@ -142,7 +144,7 @@ st.markdown(
 )
 
 # ============================================================
-# HEADER
+# 4. HEADER
 # ============================================================
 
 st.markdown(
@@ -162,19 +164,137 @@ st.markdown(
 )
 
 # ============================================================
-# CONFIGURATION
+# 5. CONFIGURATION
 # ============================================================
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL_NAME = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
+)
 
 EMBEDDING_MODEL = os.getenv(
     "GEMINI_EMBEDDING_MODEL",
     "models/gemini-embedding-001",
 )
 
+RETRIEVAL_COUNT = 4
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+
+# ============================================================
+# 6. ERROR CLASSIFICATION
+# ============================================================
+
+def is_temporary_error(exc):
+    """
+    Identify errors that may recover after waiting.
+
+    Note: Some 429 quota errors are not temporary.
+    Those should be resolved through quota or billing settings.
+    """
+
+    message = str(exc).upper()
+
+    permanent_quota_messages = [
+        "QUOTA EXCEEDED",
+        "PER DAY",
+        "DAILY LIMIT",
+        "BILLING NOT ENABLED",
+    ]
+
+    if any(item in message for item in permanent_quota_messages):
+        return False
+
+    temporary_indicators = [
+        "503",
+        "UNAVAILABLE",
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "500",
+        "INTERNAL",
+        "502",
+        "504",
+        "DEADLINE_EXCEEDED",
+        "TIMEOUT",
+        "CONNECTION RESET",
+        "SERVICE UNAVAILABLE",
+    ]
+
+    return any(
+        item in message
+        for item in temporary_indicators
+    )
+
+
+def retry_operation(
+    operation,
+    operation_name,
+    max_attempts=5,
+):
+    """
+    Retry an operation after temporary API failures.
+
+    Wait schedule:
+    3, 6, 12, 24 seconds.
+    """
+
+    for attempt in range(max_attempts):
+
+        try:
+            logger.info(
+                "%s: attempt %s/%s",
+                operation_name,
+                attempt + 1,
+                max_attempts,
+            )
+
+            result = operation()
+
+            logger.info(
+                "%s completed successfully",
+                operation_name,
+            )
+
+            return result
+
+        except Exception as exc:
+
+            if (
+                not is_temporary_error(exc)
+                or attempt == max_attempts - 1
+            ):
+                logger.exception(
+                    "%s failed",
+                    operation_name,
+                )
+                raise
+
+            wait_seconds = 3 * (2 ** attempt)
+
+            logger.warning(
+                "%s temporarily failed. "
+                "Retrying in %s seconds. "
+                "Attempt %s/%s. Error: %s",
+                operation_name,
+                wait_seconds,
+                attempt + 1,
+                max_attempts,
+                str(exc),
+            )
+
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"{operation_name} failed after all retry attempts."
+    )
+
+
+# ============================================================
+# 7. API KEY
+# ============================================================
 
 def get_api_key():
-    """Read the Google API key from environment or Streamlit Secrets."""
+    """Get Google API key from Streamlit Secrets or environment."""
 
     api_key = os.getenv("GOOGLE_API_KEY")
 
@@ -186,66 +306,90 @@ def get_api_key():
 
     if not api_key:
         raise RuntimeError(
-            "GOOGLE_API_KEY is missing. Add it under "
-            "Streamlit Cloud > App settings > Secrets."
+            "GOOGLE_API_KEY is missing. "
+            "Add it under Streamlit Cloud > App settings > Secrets."
         )
 
     return api_key
 
 
+# ============================================================
+# 8. FIND POWERPOINT
+# ============================================================
+
 def find_presentation():
-    """Find the aviation PowerPoint committed to the repository."""
+    """Find the aviation PowerPoint."""
 
     project_dir = Path(__file__).resolve().parent
 
-    candidates = [
-        project_dir / "documents" /
-        "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
-        project_dir / "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
-    ]
-
     documents_dir = project_dir / "documents"
+
+    candidates = [
+        documents_dir /
+        "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
+
+        project_dir /
+        "AAFC-POF-23-AerodynamicLimitationsv3.1.pptx",
+    ]
 
     if documents_dir.exists():
         candidates.extend(
             sorted(documents_dir.glob("*.pptx"))
         )
 
-    candidates.extend(sorted(project_dir.glob("*.pptx")))
+    candidates.extend(
+        sorted(project_dir.glob("*.pptx"))
+    )
 
     for candidate in candidates:
+
         if candidate.is_file():
-            logger.info("Using presentation: %s", candidate.name)
+
+            logger.info(
+                "Presentation found: %s",
+                candidate.name,
+            )
+
             return candidate
 
     raise FileNotFoundError(
-        "No PowerPoint presentation was found. Upload your "
-        "aviation .pptx file to the GitHub repository's "
-        "documents/ folder and commit the file."
+        "No PowerPoint presentation was found. "
+        "Check that your .pptx file is committed to "
+        "the repository's documents folder."
     )
 
 
+# ============================================================
+# 9. EXTRACT POWERPOINT CONTENT
+# ============================================================
+
 def load_presentation_documents(presentation_path):
-    """Extract slide text and retain slide numbers."""
+    """Extract readable slide text and preserve slide numbers."""
 
     presentation = Presentation(str(presentation_path))
+
     documents = []
 
     for slide_number, slide in enumerate(
         presentation.slides,
         start=1,
     ):
+
         slide_text = []
 
         for shape in slide.shapes:
+
             if getattr(shape, "has_text_frame", False):
+
                 text = shape.text.strip()
 
                 if text:
                     slide_text.append(text)
 
             if getattr(shape, "has_table", False):
+
                 for row in shape.table.rows:
+
                     cells = [
                         cell.text.strip()
                         for cell in row.cells
@@ -253,11 +397,16 @@ def load_presentation_documents(presentation_path):
                     ]
 
                     if cells:
-                        slide_text.append(" | ".join(cells))
+                        slide_text.append(
+                            " | ".join(cells)
+                        )
 
-        combined_text = "\n".join(slide_text).strip()
+        combined_text = "\n".join(
+            slide_text
+        ).strip()
 
         if combined_text:
+
             documents.append(
                 Document(
                     page_content=combined_text,
@@ -269,13 +418,14 @@ def load_presentation_documents(presentation_path):
             )
 
     if not documents:
+
         raise RuntimeError(
-            "The presentation was found, but no readable slide "
-            "text was extracted."
+            "The PowerPoint was found, but no readable "
+            "slide text could be extracted."
         )
 
     logger.info(
-        "Extracted text from %d slides",
+        "Extracted text from %s slides",
         len(documents),
     )
 
@@ -283,16 +433,19 @@ def load_presentation_documents(presentation_path):
 
 
 # ============================================================
-# BUILD CLOUD RAG DATABASE
+# 10. BUILD RAG COMPONENTS
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def load_rag_components():
     """
-    Build a cloud-side Chroma database from the PPTX.
+    Build the Chroma database and initialize Gemini.
+
+    The resource is cached during the running Streamlit process.
     """
 
     api_key = get_api_key()
+
     presentation_path = find_presentation()
 
     slide_documents = load_presentation_documents(
@@ -300,33 +453,50 @@ def load_rag_components():
     )
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
 
-    chunks = splitter.split_documents(slide_documents)
+    chunks = splitter.split_documents(
+        slide_documents
+    )
 
     if not chunks:
+
         raise RuntimeError(
-            "No text chunks could be created from the presentation."
+            "No text chunks could be created."
         )
 
-    logger.info("Created %d presentation chunks", len(chunks))
+    logger.info(
+        "Created %s presentation chunks",
+        len(chunks),
+    )
 
     embeddings = GoogleGenerativeAIEmbeddings(
         model=EMBEDDING_MODEL,
         google_api_key=api_key,
     )
 
-    database_path = tempfile.mkdtemp(
-        prefix="aerorag_chroma_"
-    )
+    def create_vectorstore():
+        """
+        Create a fresh temporary database for each build attempt.
+        """
 
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name="aviation",
-        persist_directory=database_path,
+        database_path = tempfile.mkdtemp(
+            prefix="aerorag_chroma_"
+        )
+
+        return Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            collection_name="aviation",
+            persist_directory=database_path,
+        )
+
+    vectorstore = retry_operation(
+        create_vectorstore,
+        operation_name="Chroma database creation",
+        max_attempts=4,
     )
 
     llm = ChatGoogleGenerativeAI(
@@ -336,99 +506,127 @@ def load_rag_components():
     )
 
     logger.info(
-        "AeroRAG database and language model initialized successfully"
+        "AeroRAG components initialized successfully"
     )
 
     return vectorstore, llm
 
 
 # ============================================================
-# GEMINI RETRY FUNCTION
+# 11. RETRIEVE RELEVANT INFORMATION
 # ============================================================
 
-def generate_answer_with_retry(llm, prompt, max_attempts=3):
-    """
-    Generate an answer with retries for temporary Gemini errors.
+def retrieve_documents(vectorstore, question):
+    """Search ChromaDB with retry handling."""
 
-    Retry delays:
-    Attempt 1 failure: wait 2 seconds.
-    Attempt 2 failure: wait 4 seconds.
-    Attempt 3 failure: report the error.
-    """
+    return retry_operation(
+        lambda: vectorstore.similarity_search(
+            question,
+            k=RETRIEVAL_COUNT,
+        ),
+        operation_name="Document retrieval",
+        max_attempts=4,
+    )
 
-    for attempt in range(max_attempts):
 
-        try:
-            logger.info(
-                "Gemini generation attempt %s/%s",
-                attempt + 1,
-                max_attempts,
-            )
+# ============================================================
+# 12. GENERATE ANSWER
+# ============================================================
 
-            response = llm.invoke(prompt)
+def generate_answer_with_retry(llm, prompt):
+    """Generate a Gemini answer with temporary-error retries."""
 
-            logger.info("Gemini generated an answer successfully")
+    return retry_operation(
+        lambda: llm.invoke(prompt),
+        operation_name="Gemini answer generation",
+        max_attempts=5,
+    )
 
-            return response
 
-        except Exception as exc:
+# ============================================================
+# 13. PREPARE CONTEXT
+# ============================================================
 
-            error_message = str(exc).upper()
+def prepare_context(retrieved_docs):
+    """Prepare retrieved excerpts and preserve slide references."""
 
-            temporary_error = any(
-                error in error_message
-                for error in [
-                    "503",
-                    "UNAVAILABLE",
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "500",
-                    "INTERNAL",
-                    "502",
-                    "504",
-                    "DEADLINE_EXCEEDED",
-                ]
-            )
+    context_parts = []
 
-            if temporary_error and attempt < max_attempts - 1:
+    for index, doc in enumerate(
+        retrieved_docs,
+        start=1,
+    ):
 
-                wait_seconds = 2 ** (attempt + 1)
+        metadata = doc.metadata or {}
 
-                logger.warning(
-                    "Gemini temporarily unavailable. "
-                    "Retrying in %s seconds. Attempt %s/%s",
-                    wait_seconds,
-                    attempt + 1,
-                    max_attempts,
-                )
+        slide = metadata.get("slide")
 
-                time.sleep(wait_seconds)
+        label = (
+            f"Slide {slide}"
+            if slide is not None
+            else f"Excerpt {index}"
+        )
+
+        context_parts.append(
+            f"{label}:\n{doc.page_content}"
+        )
+
+    return "\n\n".join(context_parts)
+
+
+# ============================================================
+# 14. CLEAN MODEL RESPONSE
+# ============================================================
+
+def clean_answer(response):
+    """Convert Gemini response content into readable text."""
+
+    answer = response.content
+
+    if isinstance(answer, list):
+
+        text_parts = []
+
+        for item in answer:
+
+            if isinstance(item, dict):
+
+                if item.get("type") == "text":
+                    text_parts.append(
+                        item.get("text", "")
+                    )
 
             else:
+                text_parts.append(str(item))
 
-                logger.exception(
-                    "Error while generating the RAG answer"
-                )
+        answer = "\n".join(text_parts)
 
-                if temporary_error:
-                    raise RuntimeError(
-                        "Gemini is temporarily unavailable or "
-                        "experiencing high demand. Please try again "
-                        "in a few minutes."
-                    ) from exc
+    if not isinstance(answer, str):
+        answer = str(answer)
 
-                raise
+    answer = answer.strip()
+
+    if not answer:
+        raise RuntimeError(
+            "Gemini returned an empty answer."
+        )
+
+    return answer
 
 
 # ============================================================
-# QUESTION INPUT
+# 15. QUESTION INPUT
 # ============================================================
 
-st.markdown("### Aviation Knowledge Assistant")
+st.markdown(
+    "### Aviation Knowledge Assistant"
+)
 
 question = st.text_input(
     "Ask an aviation question",
-    placeholder="Example: What does the maneuver envelope represent?",
+    placeholder=(
+        "Example: What does the maneuver envelope represent?"
+    ),
     key="aviation_question",
 )
 
@@ -438,46 +636,137 @@ ask_button = st.button(
 )
 
 # ============================================================
-# RETRIEVAL AND ANSWER GENERATION
+# 16. MAIN RAG WORKFLOW
 # ============================================================
 
 if ask_button:
 
     if not question.strip():
-        st.warning("Please enter a question first.")
+
+        st.warning(
+            "Please enter an aviation question first."
+        )
 
     else:
 
+        logger.info(
+            "New question received"
+        )
+
+        retrieved_docs = []
+
+        # ----------------------------------------------------
+        # STEP A: INITIALIZE DATABASE AND MODELS
+        # ----------------------------------------------------
+
         try:
-            logger.info("Received a RAG question")
 
             with st.spinner(
                 "Preparing aviation knowledge database..."
             ):
+
                 vectorstore, llm = load_rag_components()
 
-            with st.spinner("Searching aviation knowledge..."):
+        except Exception as exc:
+
+            logger.exception(
+                "RAG initialization failed"
+            )
+
+            st.error(
+                "AeroRAG could not initialize its database "
+                "or AI services."
+            )
+
+            if is_temporary_error(exc):
+
+                st.warning(
+                    "A Google AI service may be temporarily "
+                    "unavailable. Please try again later."
+                )
+
+            else:
+
+                st.info(
+                    "Check your API key, PowerPoint file, "
+                    "dependencies, and Streamlit Cloud logs."
+                )
+
+            st.stop()
+
+        # ----------------------------------------------------
+        # STEP B: RETRIEVE DOCUMENTS
+        # ----------------------------------------------------
+
+        try:
+
+            with st.spinner(
+                "Searching aviation knowledge..."
+            ):
 
                 retrieval_start = time.time()
 
-                retrieved_docs = vectorstore.similarity_search(
+                retrieved_docs = retrieve_documents(
+                    vectorstore,
                     question,
-                    k=4,
                 )
 
                 logger.info(
-                    "Retrieved %d documents in %.2f seconds",
+                    "Retrieved %s documents in %.2f seconds",
                     len(retrieved_docs),
                     time.time() - retrieval_start,
                 )
 
-            if not retrieved_docs:
-                st.warning(
-                    "No relevant presentation excerpts were found."
-                )
-                st.stop()
+        except Exception as exc:
 
-            context_parts = []
+            logger.exception(
+                "Document retrieval failed"
+            )
+
+            st.error(
+                "AeroRAG could not search the aviation database."
+            )
+
+            if is_temporary_error(exc):
+
+                st.warning(
+                    "The Google embedding service may be "
+                    "temporarily unavailable. Please try again."
+                )
+
+            else:
+
+                st.info(
+                    "Check the embedding configuration and "
+                    "database initialization in the logs."
+                )
+
+            st.stop()
+
+        # ----------------------------------------------------
+        # STEP C: CHECK RETRIEVAL RESULTS
+        # ----------------------------------------------------
+
+        if not retrieved_docs:
+
+            st.warning(
+                "No relevant presentation excerpts were found."
+            )
+
+            st.stop()
+
+        context = prepare_context(
+            retrieved_docs
+        )
+
+        # ----------------------------------------------------
+        # STEP D: DISPLAY RETRIEVED INFORMATION
+        # ----------------------------------------------------
+
+        with st.expander(
+            "Retrieved presentation excerpts",
+            expanded=False,
+        ):
 
             for index, doc in enumerate(
                 retrieved_docs,
@@ -485,150 +774,135 @@ if ask_button:
             ):
 
                 metadata = doc.metadata or {}
+
                 slide = metadata.get("slide")
 
-                label = (
+                heading = (
                     f"Slide {slide}"
                     if slide is not None
                     else f"Excerpt {index}"
                 )
 
-                context_parts.append(
-                    f"{label}:\n{doc.page_content}"
+                st.markdown(
+                    f"**{heading}**"
                 )
 
-            context = "\n\n".join(context_parts)
+                st.write(
+                    doc.page_content
+                )
 
-            prompt = f"""
+        # ----------------------------------------------------
+        # STEP E: PREPARE PROMPT
+        # ----------------------------------------------------
+
+        prompt = f"""
 You are AeroRAG, an aviation knowledge assistant.
 
-Answer the user's question using only the presentation excerpts
-provided below.
+Your task is to answer the user's question using
+ONLY the presentation excerpts provided below.
 
-Instructions:
-- Give a clear, direct, professional answer.
-- Mention slide numbers when possible.
-- Do not invent aviation facts not supported by the excerpts.
-- If the excerpts do not contain enough information, say so.
-- Keep the answer easy to understand.
+RULES:
 
-Presentation excerpts:
+1. Give a clear, direct, professional answer.
+2. Use only information supported by the excerpts.
+3. Do not invent aviation facts.
+4. Mention slide numbers whenever possible.
+5. If the excerpts do not contain enough information,
+   clearly say that the information could not be found.
+6. If the question is ambiguous, explain the ambiguity.
+7. Keep the answer understandable and concise.
+
+PRESENTATION EXCERPTS:
+
 {context}
 
-Question:
+USER QUESTION:
+
 {question}
 
-Answer:
+ANSWER:
 """
 
-            # ====================================================
-            # GEMINI ANSWER GENERATION WITH AUTOMATIC RETRIES
-            # ====================================================
+        # ----------------------------------------------------
+        # STEP F: GENERATE ANSWER
+        # ----------------------------------------------------
+
+        try:
 
             with st.spinner(
-                "Generating your answer..."
+                "Generating your aviation answer..."
             ):
 
                 generation_start = time.time()
 
-                try:
-                    response = generate_answer_with_retry(
-                        llm,
-                        prompt,
-                        max_attempts=3,
-                    )
+                response = generate_answer_with_retry(
+                    llm,
+                    prompt,
+                )
 
-                except RuntimeError as exc:
-
-                    st.warning(str(exc))
-                    st.info(
-                        "Your aviation database is still available. "
-                        "Please try asking your question again later."
-                    )
-
-                    st.stop()
-
-                except Exception:
-
-                    logger.exception(
-                        "Unexpected Gemini generation failure"
-                    )
-
-                    st.error(
-                        "AeroRAG encountered an unexpected error "
-                        "while generating your answer."
-                    )
-
-                    st.stop()
+                answer_text = clean_answer(
+                    response
+                )
 
                 logger.info(
                     "Answer generated in %.2f seconds",
                     time.time() - generation_start,
                 )
 
-            # ====================================================
-            # CLEAN AND DISPLAY ANSWER
-            # ====================================================
+            # ------------------------------------------------
+            # STEP G: DISPLAY FINAL ANSWER
+            # ------------------------------------------------
 
-            answer_text = response.content
+            st.markdown(
+                "### Answer"
+            )
 
-            if isinstance(answer_text, list):
+            st.markdown(
+                answer_text
+            )
 
-                answer_text = "\n".join(
-                    item.get("text", "")
-                    if isinstance(item, dict)
-                    else str(item)
-                    for item in answer_text
-                )
+            st.success(
+                "Answer generated successfully."
+            )
 
-            if not isinstance(answer_text, str):
-                answer_text = str(answer_text)
-
-            st.markdown("### Answer")
-            st.markdown(answer_text)
-
-            # ====================================================
-            # RETRIEVED PRESENTATION EXCERPTS
-            # ====================================================
-
-            with st.expander(
-                "Retrieved presentation excerpts"
-            ):
-
-                for index, doc in enumerate(
-                    retrieved_docs,
-                    start=1,
-                ):
-
-                    metadata = doc.metadata or {}
-                    slide = metadata.get("slide")
-
-                    heading = (
-                        f"Slide {slide}"
-                        if slide is not None
-                        else f"Excerpt {index}"
-                    )
-
-                    st.markdown(f"**{heading}**")
-                    st.write(doc.page_content)
-
-            logger.info("Question completed successfully")
+            logger.info(
+                "Question completed successfully"
+            )
 
         except Exception as exc:
 
             logger.exception(
-                "Unexpected error in the AeroRAG workflow"
+                "Answer generation failed"
             )
 
-            st.error(
-                "AeroRAG could not complete your request."
+            st.warning(
+                "The aviation information was successfully "
+                "retrieved, but the AI model could not "
+                "generate an answer."
             )
 
-            st.caption(str(exc))
+            if is_temporary_error(exc):
+
+                st.info(
+                    "Gemini is temporarily unavailable or "
+                    "experiencing high demand. "
+                    "Your retrieved aviation excerpts are "
+                    "still available above. Please try again later."
+                )
+
+            else:
+
+                st.error(
+                    "An error occurred during answer generation."
+                )
+
+                st.caption(
+                    "Check the Streamlit Cloud logs for details."
+                )
 
 
 # ============================================================
-# FOOTER
+# 17. FOOTER
 # ============================================================
 
 st.divider()
